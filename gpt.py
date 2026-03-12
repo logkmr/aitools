@@ -11,9 +11,6 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from typing import Dict, Any, List
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # Импортируем pypdf для работы с PDF
 try:
