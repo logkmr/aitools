@@ -3,21 +3,29 @@ import logging
 import json
 import os
 import base64
+import io
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F, Router
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from typing import Dict, Any, List
+
+
+# Импортируем pypdf для работы с PDF
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Токены API
-API_TOKEN = "ss"
-OCR_API_TOKEN = "sss"
+API_TOKEN = "sss"
+OCR_API_TOKEN = "ss"
 
 # Инициализация
 bot = Bot(token=API_TOKEN)
@@ -29,11 +37,11 @@ dp.include_router(router)
 # Файл для хранения данных пользователей
 USER_DATA_FILE = "users.json"
 
-# Словарь для накопления фото из альбомов
-photo_albums = {}
-
-# Словарь для сессий пользователей (новая функция)
+# Словарь для сессий пользователей (история чата: user_id -> list)
 user_sessions = {}
+
+# Словарь для фото-сессий (user_id -> {'photos': [], 'last_message_id': None})
+photo_sessions = {}
 
 
 class UserStorage:
@@ -72,7 +80,7 @@ class UserStorage:
                         'model': old_settings.get('model'),
                         'max_tokens': old_settings.get('max_tokens', 2000),
                         'photo_processing': old_settings.get('photo_processing', 'text'),
-                        'model_prompt': old_settings.get('model_prompt', '')  # Новое поле
+                        'model_prompt': old_settings.get('model_prompt', '')
                     }
                 },
                 'active_profile': 'default',
@@ -81,17 +89,13 @@ class UserStorage:
                 'ask_before_send_photos': old_settings.get('ask_before_send_photos', True)
             }
         
-        # Миграция: переносим ask_before_send_photos из профилей в общие настройки
         if 'ask_before_send_photos' not in user_data and 'profiles' in user_data:
-            # Ищем значение в любом профиле или используем значение по умолчанию
             ask_photos_value = True
             for profile_name, profile_data in user_data['profiles'].items():
                 if 'ask_before_send_photos' in profile_data:
                     ask_photos_value = profile_data['ask_before_send_photos']
                     break
             user_data['ask_before_send_photos'] = ask_photos_value
-            
-            # Удаляем из всех профилей
             for profile_name in user_data['profiles']:
                 user_data['profiles'][profile_name].pop('ask_before_send_photos', None)
         
@@ -115,7 +119,8 @@ class UserStorage:
             'split_response': user_data.get('split_response', False),
             'ask_before_send_photos': user_data.get('ask_before_send_photos', True),
             '_active_profile_name': active_name,
-            '_all_profiles': list(user_data['profiles'].keys())
+            '_all_profiles': list(user_data['profiles'].keys()),
+            '_user_id': user_id
         }
 
     def set_user_data(self, user_id: int, user_data: Dict[str, Any]):
@@ -134,7 +139,7 @@ class UserStorage:
         self.set_user_data(user_id, user_data)
 
     def set_common_setting(self, user_id: int, key: str, value: Any):
-        """Устанавливает общий параметр (response_format, split_response, ask_before_send_photos)"""
+        """Устанавливает общий параметр"""
         user_data = self.get_user_data(user_id)
         user_data[key] = value
         self.set_user_data(user_id, user_data)
@@ -150,12 +155,12 @@ class UserStorage:
             'model': '',
             'max_tokens': 2000,
             'photo_processing': 'text',
-            'model_prompt': ''  # Новое поле
+            'model_prompt': ''
         }
         self.set_user_data(user_id, user_data)
 
     def delete_profile(self, user_id: int, profile_name: str):
-        """Удаляет профиль (если не активный или не последний)"""
+        """Удаляет профиль"""
         user_data = self.get_user_data(user_id)
         if len(user_data['profiles']) <= 1:
             raise ValueError("Нельзя удалить единственный профиль")
@@ -190,7 +195,7 @@ class UserStorage:
 user_storage = UserStorage(USER_DATA_FILE)
 
 
-# Состояния для редактирования профилей
+# Состояния
 class ProfileStates(StatesGroup):
     waiting_for_name = State()
     waiting_for_baseurl = State()
@@ -199,23 +204,22 @@ class ProfileStates(StatesGroup):
     waiting_for_max_tokens = State()
     waiting_for_rename = State()
     waiting_for_delete_confirm = State()
-    waiting_for_model_prompt = State()  # Новое состояние
+    waiting_for_model_prompt = State()
 
 
-# Состояния для настроек
 class SettingsStates(StatesGroup):
     baseurl = State()
     apikey = State()
     model = State()
     max_tokens = State()
 
-# Состояние для переноса профилей в ВК
+
 class TransferStates(StatesGroup):
     waiting_for_vk_id = State()
 
 
 # ————————————————————————————————————————————————————————
-# Утилиты для интерфейса
+# UI Utilities
 # ————————————————————————————————————————————————————————
 
 def get_profile_settings_text(settings: Dict[str, Any]) -> str:
@@ -257,84 +261,76 @@ def get_profile_settings_text(settings: Dict[str, Any]) -> str:
 def get_profile_keyboard(settings: Dict[str, Any]) -> types.InlineKeyboardMarkup:
     response_format = settings.get('response_format', 'normal')
     split_response = settings.get('split_response', False)
-    photo_processing = settings.get('photo_processing', 'text')
-    
+
+    # Кнопки в один ряд: изменить промпт, очистить промпт
+    prompt_buttons = [
+        [
+            types.InlineKeyboardButton(text="💬 Изменить промпт", callback_data="change_model_prompt"),
+            types.InlineKeyboardButton(text="🗑️ Очистить промпт", callback_data="clear_model_prompt")
+        ]
+    ]
+
+    # Кнопка смены профиля отдельно внизу
+    profile_button = [
+        [types.InlineKeyboardButton(text="👤 Сменить профиль", callback_data="manage_profiles")]
+    ]
+
+    # Кнопки формата ответа в один ряд
     format_buttons = [
         [
-            types.InlineKeyboardButton(
-                text=f"{'✅' if response_format == 'normal' else '○'} Обычный", 
-                callback_data="format_normal"
-            ),
-            types.InlineKeyboardButton(
-                text=f"{'✅' if response_format == 'medium' else '○'} Средний", 
-                callback_data="format_medium"
-            ),
-            types.InlineKeyboardButton(
-                text=f"{'✅' if response_format == 'short' else '○'} Короткий", 
-                callback_data="format_short"
-            )
+            types.InlineKeyboardButton(text=f"{'✅' if response_format == 'normal' else '○'} Обычный", callback_data="format_normal"),
+            types.InlineKeyboardButton(text=f"{'✅' if response_format == 'medium' else '○'} Средний", callback_data="format_medium"),
+            types.InlineKeyboardButton(text=f"{'✅' if response_format == 'short' else '○'} Короткий", callback_data="format_short")
         ]
     ]
-    
+
+    # Кнопки разделения ответа в один ряд
     split_buttons = [
         [
-            types.InlineKeyboardButton(
-                text=f"{'✅' if split_response else '○'} Разделять", 
-                callback_data="split_true"
-            ),
-            types.InlineKeyboardButton(
-                text=f"{'✅' if not split_response else '○'} Не разделять", 
-                callback_data="split_false"
-            )
+            types.InlineKeyboardButton(text=f"{'✅' if split_response else '○'} Разделять", callback_data="split_true"),
+            types.InlineKeyboardButton(text=f"{'✅' if not split_response else '○'} Не разделять", callback_data="split_false")
         ]
     ]
+
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="⚙️ Параметры запроса", callback_data="show_request_params")],
+        [types.InlineKeyboardButton(text="📝 Формат ответа", callback_data="show_formats")],
+        *format_buttons,
+        [types.InlineKeyboardButton(text="📋 Разделение ответа", callback_data="show_split")],
+        *split_buttons,
+        *prompt_buttons,
+        *profile_button
+    ])
+    return keyboard
+
+
+def get_request_params_keyboard(settings: Dict[str, Any]) -> types.InlineKeyboardMarkup:
+    photo_processing = settings.get('photo_processing', 'text')
     
     photo_buttons = [
         [
-            types.InlineKeyboardButton(
-                text=f"{'✅' if photo_processing == 'text' else '○'} Как текст (OCR)", 
-                callback_data="photo_text"
-            ),
-            types.InlineKeyboardButton(
-                text=f"{'✅' if photo_processing == 'image' else '○'} Как фото (Vision)", 
-                callback_data="photo_image"
-            )
+            types.InlineKeyboardButton(text=f"{'✅' if photo_processing == 'text' else '○'} Как текст (OCR)", callback_data="photo_text"),
+            types.InlineKeyboardButton(text=f"{'✅' if photo_processing == 'image' else '○'} Как фото (Vision)", callback_data="photo_image")
         ]
     ]
-    
+
     ask_photo_buttons = [
         [
-            types.InlineKeyboardButton(
-                text=f"{'✅' if settings.get('ask_before_send_photos', True) else '○'} Спрашивать", 
-                callback_data="ask_photo_true"
-            ),
-            types.InlineKeyboardButton(
-                text=f"{'✅' if not settings.get('ask_before_send_photos', True) else '○'} Отправлять сразу", 
-                callback_data="ask_photo_false"
-            )
+            types.InlineKeyboardButton(text=f"{'✅' if settings.get('ask_before_send_photos', True) else '○'} Спрашивать", callback_data="ask_photo_true"),
+            types.InlineKeyboardButton(text=f"{'✅' if not settings.get('ask_before_send_photos', True) else '○'} Отправлять сразу", callback_data="ask_photo_false")
         ]
     ]
-    
-    profile_buttons = [
-        [types.InlineKeyboardButton(text="👤 Управление профилями", callback_data="manage_profiles")],
-        [types.InlineKeyboardButton(text="💬 Изменить промпт модели", callback_data="change_model_prompt")],
-        [types.InlineKeyboardButton(text="🗑️ Очистить промпт модели", callback_data="clear_model_prompt")]
-    ]
-    
+
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="🔗 Изменить Base URL", callback_data="change_baseurl")],
         [types.InlineKeyboardButton(text="🔑 Изменить API ключ", callback_data="change_apikey")],
         [types.InlineKeyboardButton(text="🤖 Изменить модель", callback_data="change_model")],
         [types.InlineKeyboardButton(text="📊 Изменить макс. токены", callback_data="change_tokens")],
-        [types.InlineKeyboardButton(text="🖼️ Изменить обработку фото", callback_data="change_photo_processing")],
+        [types.InlineKeyboardButton(text="🖼️ Обработка фото", callback_data="show_photo_processing")],
+        *photo_buttons,
         [types.InlineKeyboardButton(text="📸 Подтверждение отправки фото", callback_data="show_ask_photo")],
         *ask_photo_buttons,
-        [types.InlineKeyboardButton(text="📝 Формат ответа", callback_data="show_formats")],
-        *format_buttons,
-        [types.InlineKeyboardButton(text="📋 Разделение ответа", callback_data="show_split")],
-        *split_buttons,
-        *profile_buttons,
-        [types.InlineKeyboardButton(text="❌ Закрыть настройки", callback_data="close_settings")]
+        [types.InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_settings")]
     ])
     return keyboard
 
@@ -344,18 +340,9 @@ def get_profiles_manager_keyboard(profiles: List[str], active: str) -> types.Inl
     for name in profiles:
         mark = "✅ " if name == active else "○ "
         row_buttons = [
-            types.InlineKeyboardButton(
-                text=f"{mark}{name}",
-                callback_data=f"switch_profile_{name}"
-            ),
-            types.InlineKeyboardButton(
-                text="✏️",
-                callback_data=f"rename_profile_{name}"
-            ),
-            types.InlineKeyboardButton(
-                text="🗑️",
-                callback_data=f"delete_profile_{name}"
-            )
+            types.InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"switch_profile_{name}"),
+            types.InlineKeyboardButton(text="✏️", callback_data=f"rename_profile_{name}"),
+            types.InlineKeyboardButton(text="🗑️", callback_data=f"delete_profile_{name}")
         ]
         buttons.append(row_buttons)
     
@@ -365,7 +352,6 @@ def get_profiles_manager_keyboard(profiles: List[str], active: str) -> types.Inl
 
 
 def get_album_confirmation_keyboard() -> types.InlineKeyboardMarkup:
-    """Клавиатура для подтверждения отправки альбома"""
     return types.InlineKeyboardMarkup(inline_keyboard=[
         [
             types.InlineKeyboardButton(text="✅ Отправить", callback_data="album_send"),
@@ -375,7 +361,7 @@ def get_album_confirmation_keyboard() -> types.InlineKeyboardMarkup:
 
 
 # ————————————————————————————————————————————————————————
-# Обработчики команд и кнопок
+# Command Handlers
 # ————————————————————————————————————————————————————————
 
 @router.message(Command("start"))
@@ -387,26 +373,25 @@ async def cmd_start(message: types.Message):
         "🤖 Бот для работы с ChatGPT\n"
         "Доступные команды:\n"
         "/settings — Настройки API\n"
-        "/show_settings — Показать текущие настройки\n"
-        "/delete_settings — Удалить мои настройки\n"
-        "Просто отправьте текст или фото — бот автоматически ответит!\nБот в ВК - https://vk.ru/club235624714",
+        "/show_settings — Показать настройки\n"
+        "/clear — Очистить контекст беседы\n"
+        "Отправьте текст, фото или файл (код, текст) — бот ответит!\nБот в ВК - https://vk.ru/club235624714",
         reply_markup=keyboard
     )
 
 
+@router.message(Command("clear"))
+async def cmd_clear(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in user_sessions:
+        user_sessions[user_id] = []
+    await message.answer("🧹 Контекст беседы очищен.")
+
+
 @router.callback_query(F.data == "transfer_to_vk")
 async def transfer_to_vk_handler(callback: types.CallbackQuery, state: FSMContext):
-    """Обработчик начала переноса профилей в ВК"""
     await callback.message.answer(
-        "📤 Перенос профилей в ВК бота\n\n"
-        "Введите ваш ID пользователя ВКонтакте (число).\n\n"
-        "Чтобы узнать свой ID:\n"
-        "Перейдите по ссылке: https://vk.com/account?open_page=personal\n"
-        "Там отображается ваш ID пользователя.\n\n"
-        "Или:\n"
-        "1. Откройте свой профиль ВК\n"
-        "2. Скопируйте число из URL (например, vk.com/id123456789)\n"
-        "3. Отправьте это число боту"
+        "📤 Перенос профилей в ВК бота\nВведите ваш ID пользователя ВКонтакте (число)."
     )
     await state.set_state(TransferStates.waiting_for_vk_id)
     await callback.answer()
@@ -414,43 +399,27 @@ async def transfer_to_vk_handler(callback: types.CallbackQuery, state: FSMContex
 
 @router.message(TransferStates.waiting_for_vk_id)
 async def process_vk_id(message: types.Message, state: FSMContext):
-    """Обработка ID ВК и перенос профилей"""
     try:
         vk_id = int(message.text.strip())
-        if vk_id <= 0:
-            await message.answer("❌ ID должен быть положительным числом. Перенос отменен.")
-            await state.clear()
-            return
+        if vk_id <= 0: raise ValueError
     except ValueError:
-        await message.answer("❌ Пожалуйста, введите корректный ID (число). Перенос отменен.")
+        await message.answer("❌ Введите корректный ID (число).")
         await state.clear()
         return
     
     user_id = message.from_user.id
     user_data = user_storage.get_user_data(user_id)
-    
     if not user_data or not user_data.get('profiles'):
-        await message.answer("❌ У вас нет профилей для переноса. Сначала создайте профили через /settings")
+        await message.answer("❌ Нет профилей для переноса.")
         await state.clear()
         return
     
-    # Загружаем данные ВК бота
     vk_storage = UserStorage("users_vk.json")
     vk_users = vk_storage.load_users()
-    
-    # Переносим профили
     vk_users[str(vk_id)] = user_data
-    
-    # Сохраняем в файл ВК бота
     vk_storage.save_users(vk_users)
     
-    profiles_count = len(user_data.get('profiles', {}))
-    await message.answer(
-        f"✅ Профили успешно перенесены в ВК бота!\n\n"
-        f"📊 Перенесено профилей: {profiles_count}\n"
-        f"🆔 Ваш ID ВК: {vk_id}\n\n"
-        f"Теперь вы можете использовать эти профили в ВК боте. Ссылка на него: https://vk.ru/club235624714"
-    )
+    await message.answer(f"✅ Профили перенесены! ID ВК: {vk_id}")
     await state.clear()
 
 
@@ -463,16 +432,116 @@ async def cmd_settings(message: types.Message):
         parse_mode='HTML'
     )
 
+@router.message(F.document)
+async def handle_document(message: types.Message):
+    user_id = message.from_user.id
+    settings = user_storage.get_active_profile_settings(user_id)
+    
+    if not settings.get('baseurl'):
+        await message.answer("❌ Сначала введите настройки (/settings)")
+        return
+
+    doc = message.document
+    processing_msg = await message.answer(f"📥 Скачиваю файл «{doc.file_name}»...")
+
+    try:
+        # Скачиваем файл в память
+        file = await bot.get_file(doc.file_id)
+        file_io = io.BytesIO()
+        await bot.download_file(file.file_path, file_io)
+        file_io.seek(0) # Возвращаемся в начало файла
+
+        extracted_text = ""
+        error_msg = ""
+
+        # Сценарий 1: Это PDF
+        if doc.mime_type == 'application/pdf':
+            if PdfReader is None:
+                await processing_msg.edit_text("❌ Библиотека pypdf не установлена. Владелец бота должен выполнить: `pip install pypdf`", parse_mode='Markdown')
+                return
+            
+            try:
+                reader = PdfReader(file_io)
+                text_pages = []
+                for i, page in enumerate(reader.pages):
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_pages.append(f"[Страница {i+1}]:\n{page_text}")
+                
+                extracted_text = "\n\n".join(text_pages)
+                if not extracted_text:
+                    error_msg = "⚠️ Текст в PDF не найден. Возможно, это скан (картинки без текстового слоя)."
+            except Exception as e:
+                error_msg = f"Ошибка чтения PDF: {str(e)}"
+
+        # Сценарий 2: Это изображение файлом (png, jpg)
+        elif doc.mime_type and doc.mime_type.startswith('image/'):
+            # Передаем в обработчик фото как Vision или OCR
+            # Для простоты здесь: если это фото-файл, конвертируем в base64 и шлем как картинку
+            image_base64 = base64.b64encode(file_io.read()).decode('utf-8')
+            prompt = message.caption or "Что в этом файле?"
+            await processing_msg.edit_text(f"🖼️ Анализирую изображение через {settings['model']}...")
+            try:
+                ans = await send_image_to_api(settings, image_base64, prompt)
+                await processing_msg.delete()
+                await send_response(message.chat.id, ans, settings)
+                return
+            except Exception as e:
+                await processing_msg.edit_text(f"❌ Ошибка Vision: {e}")
+                return
+
+        # Сценарий 3: Пробуем читать как обычный текст (txt, py, json, md)
+        else:
+            try:
+                extracted_text = file_io.read().decode('utf-8')
+            except UnicodeDecodeError:
+                error_msg = "❌ Не удалось прочитать файл как текст (неверная кодировка или бинарный файл)."
+
+        # Если возникла ошибка при чтении
+        if error_msg:
+            await processing_msg.edit_text(error_msg)
+            return
+        
+        # Если текст слишком большой, обрезаем (лимит токенов модели)
+        # Грубая оценка: 1 символ ~= 0.5-1 токен. Ограничим на вход ~40000 символов для безопасности
+        if len(extracted_text) > 40000:
+            extracted_text = extracted_text[:40000] + "\n\n[...Текст обрезан, так как он слишком длинный...]"
+
+        # Формируем запрос
+        user_query = message.caption or "Проанализируй этот файл и сделай краткую выжимку."
+        final_prompt = (
+            f"Пользователь загрузил файл: {doc.file_name}\n"
+            f"Содержимое файла:\n'''\n{extracted_text}\n'''\n\n"
+            f"Запрос пользователя: {user_query}"
+        )
+
+        await processing_msg.edit_text(f"🔄 Читаю файл и отправляю в {settings['model']}...")
+        response = await send_to_chatgpt(settings, final_prompt)
+        
+        await processing_msg.delete()
+        await send_response(message.chat.id, response, settings)
+
+    except Exception as e:
+        logger.error(f"File error: {e}")
+        await processing_msg.edit_text(f"❌ Критическая ошибка: {e}")
+
+
+# ————————————————————————————————————————————————————————
+# Profile Management Handlers
+# ————————————————————————————————————————————————————————
 
 @router.callback_query(F.data == "manage_profiles")
 async def manage_profiles(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     settings = user_storage.get_active_profile_settings(user_id)
-    await callback.message.edit_text(
-        "👤 <b>Управление профилями</b>\nВыберите профиль для активации или создайте новый:",
-        reply_markup=get_profiles_manager_keyboard(settings['_all_profiles'], settings['_active_profile_name']),
-        parse_mode='HTML'
-    )
+    try:
+        await callback.message.edit_text(
+            "👤 <b>Управление профилями</b>",
+            reply_markup=get_profiles_manager_keyboard(settings['_all_profiles'], settings['_active_profile_name']),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
     await callback.answer()
 
 
@@ -480,11 +549,29 @@ async def manage_profiles(callback: types.CallbackQuery):
 async def back_to_settings(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     settings = user_storage.get_active_profile_settings(user_id)
-    await callback.message.edit_text(
-        get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
-        parse_mode='HTML'
-    )
+    try:
+        await callback.message.edit_text(
+            get_profile_settings_text(settings),
+            reply_markup=get_profile_keyboard(settings),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == "show_request_params")
+async def show_request_params(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    settings = user_storage.get_active_profile_settings(user_id)
+    try:
+        await callback.message.edit_text(
+            get_profile_settings_text(settings),
+            reply_markup=get_request_params_keyboard(settings),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
     await callback.answer()
 
 
@@ -495,33 +582,35 @@ async def switch_profile_handler(callback: types.CallbackQuery):
     try:
         user_storage.switch_profile(user_id, profile_name)
         settings = user_storage.get_active_profile_settings(user_id)
-        await callback.message.edit_text(
-            get_profile_settings_text(settings),
-            reply_markup=get_profile_keyboard(settings),
-            parse_mode='HTML'
-        )
+        try:
+            await callback.message.edit_text(
+                get_profile_settings_text(settings),
+                reply_markup=get_profile_keyboard(settings),
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+        await callback.answer("✅ Профиль переключён")
     except Exception as e:
         await callback.answer(f"Ошибка: {str(e)}", show_alert=True)
-    else:
-        await callback.answer("✅ Профиль переключён")
 
 
 @router.callback_query(F.data.startswith("delete_profile_"))
-async def delete_profile_handler(callback: types.CallbackQuery, state: FSMContext):
+async def delete_profile_handler(callback: types.CallbackQuery):
     profile_name = callback.data.replace("delete_profile_", "")
     user_id = callback.from_user.id
-    
-    # Проверяем, можно ли удалить профиль
     try:
         user_storage.delete_profile(user_id, profile_name)
-        # Если удаление успешно, обновляем список профилей
         settings = user_storage.get_active_profile_settings(user_id)
-        await callback.message.edit_text(
-            "👤 <b>Управление профилями</b>\nВыберите профиль для активации или создайте новый:",
-            reply_markup=get_profiles_manager_keyboard(settings['_all_profiles'], settings['_active_profile_name']),
-            parse_mode='HTML'
-        )
-        await callback.answer(f"✅ Профиль «{profile_name}» удалён")
+        try:
+            await callback.message.edit_text(
+                "👤 <b>Управление профилями</b>",
+                reply_markup=get_profiles_manager_keyboard(settings['_all_profiles'], settings['_active_profile_name']),
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+        await callback.answer(f"✅ Профиль удалён")
     except Exception as e:
         await callback.answer(f"❌ {str(e)}", show_alert=True)
 
@@ -529,8 +618,6 @@ async def delete_profile_handler(callback: types.CallbackQuery, state: FSMContex
 @router.callback_query(F.data.startswith("rename_profile_"))
 async def rename_profile_handler(callback: types.CallbackQuery, state: FSMContext):
     old_name = callback.data.replace("rename_profile_", "")
-    user_id = callback.from_user.id
-    
     await callback.message.answer(f"Введите новое имя для профиля «{old_name}»:")
     await state.set_state(ProfileStates.waiting_for_rename)
     await state.update_data(old_name=old_name)
@@ -540,12 +627,7 @@ async def rename_profile_handler(callback: types.CallbackQuery, state: FSMContex
 @router.message(ProfileStates.waiting_for_rename)
 async def process_profile_rename(message: types.Message, state: FSMContext):
     new_name = message.text.strip()
-    if not new_name:
-        await message.answer("❌ Имя не может быть пустым. Попробуйте снова:")
-        return
-    if len(new_name) > 32:
-        await message.answer("❌ Имя слишком длинное (макс. 32 символа). Попробуйте снова:")
-        return
+    if not new_name: return
     
     user_data = await state.get_data()
     old_name = user_data['old_name']
@@ -555,13 +637,13 @@ async def process_profile_rename(message: types.Message, state: FSMContext):
         user_storage.rename_profile(user_id, old_name, new_name)
         settings = user_storage.get_active_profile_settings(user_id)
         await message.answer(
-            f"✅ Профиль «{old_name}» переименован в «{new_name}»",
+            f"✅ Профиль переименован",
             reply_markup=get_profiles_manager_keyboard(settings['_all_profiles'], settings['_active_profile_name']),
             parse_mode='HTML'
         )
         await state.clear()
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}\nПопробуйте другое имя:")
+        await message.answer(f"❌ Ошибка: {str(e)}")
 
 
 @router.callback_query(F.data == "create_profile")
@@ -574,30 +656,24 @@ async def create_profile_start(callback: types.CallbackQuery, state: FSMContext)
 @router.message(ProfileStates.waiting_for_name)
 async def create_profile_name(message: types.Message, state: FSMContext):
     name = message.text.strip()
-    if not name:
-        await message.answer("❌ Имя не может быть пустым. Попробуйте снова:")
-        return
-    if len(name) > 32:
-        await message.answer("❌ Имя слишком длинное (макс. 32 символа). Попробуйте снова:")
-        return
+    if not name: return
     user_id = message.from_user.id
     try:
         user_storage.create_profile(user_id, name)
         user_storage.switch_profile(user_id, name)
         settings = user_storage.get_active_profile_settings(user_id)
         await message.answer(
-            f"✅ Профиль «{name}» создан и активирован.\nТеперь настройте его параметры:",
+            f"✅ Профиль «{name}» создан",
             reply_markup=get_profile_keyboard(settings),
             parse_mode='HTML'
         )
         await state.clear()
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}\nПопробуйте другое имя:")
-        return
+        await message.answer(f"❌ Ошибка: {str(e)}")
 
 
 # ————————————————————————————————————————————————————————
-# Обработка изменений настроек (включая промпт модели)
+# Settings Changes Handlers
 # ————————————————————————————————————————————————————————
 
 @router.callback_query(F.data.startswith("change_"))
@@ -613,49 +689,12 @@ async def handle_settings_change(callback: types.CallbackQuery, state: FSMContex
         await callback.message.answer("Введите новую модель:")
         await state.set_state(SettingsStates.model)
     elif action == "change_tokens":
-        await callback.message.answer(
-            "Введите максимальное количество токенов (например: 2000):\n"
-            "Рекомендации:\n"
-            "• 500-1000 — короткие ответы\n"
-            "• 1000-2000 — средние ответы\n"
-            "• 2000-4000 — длинные ответы\n"
-            "• 4000+ — очень длинные ответы"
-        )
+        await callback.message.answer("Введите макс. количество токенов (число):")
         await state.set_state(SettingsStates.max_tokens)
     elif action == "change_photo_processing":
-        settings = user_storage.get_active_profile_settings(callback.from_user.id)
-        photo_processing = settings.get('photo_processing', 'text')
-        
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [
-                types.InlineKeyboardButton(
-                    text=f"{'✅' if photo_processing == 'text' else '○'} Как текст (OCR)", 
-                    callback_data="photo_text"
-                ),
-                types.InlineKeyboardButton(
-                    text=f"{'✅' if photo_processing == 'image' else '○'} Как фото (Vision)", 
-                    callback_data="photo_image"
-                )
-            ],
-            [types.InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_settings")]
-        ])
-        
-        await callback.message.edit_text(
-            "🖼️ <b>Обработка фото</b>\n\n"
-            "📝 <b>Как текст (OCR)</b> - распознает текст с изображения и отправляет его модели\n"
-            "🖼️ <b>Как фото (Vision)</b> - отправляет само изображение в модель (требует поддержки vision)",
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
+        await callback.answer()
     elif action == "change_model_prompt":
-        await callback.message.answer(
-            "Введите промпт для модели. Этот текст будет добавляться перед каждым запросом пользователя:\n\n"
-            "Например:\n"
-            "• «Отвечай как опытный преподаватель»\n"
-            "• «Объясняй простыми словами»\n"
-            "• «Отвечай кратко и по делу»\n\n"
-            "Отправьте текст промпта или /cancel для отмены:"
-        )
+        await callback.message.answer("Введите промпт для модели (/cancel для отмены):")
         await state.set_state(ProfileStates.waiting_for_model_prompt)
     await callback.answer()
 
@@ -665,32 +704,28 @@ async def clear_model_prompt(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     user_storage.set_profile_setting(user_id, 'model_prompt', '')
     settings = user_storage.get_active_profile_settings(user_id)
-    await callback.message.edit_text(
-        get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
-        parse_mode='HTML'
-    )
-    await callback.answer("✅ Промпт модели очищен")
+    try:
+        await callback.message.edit_text(
+            get_profile_settings_text(settings),
+            reply_markup=get_profile_keyboard(settings),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+    await callback.answer("✅ Промпт очищен")
 
 
 @router.message(ProfileStates.waiting_for_model_prompt)
 async def process_model_prompt(message: types.Message, state: FSMContext):
     if message.text == "/cancel":
         await state.clear()
-        await message.answer("❌ Изменение промпта отменено")
+        await message.answer("❌ Отменено")
         return
-        
-    model_prompt = message.text.strip()
-    if not model_prompt:
-        await message.answer("❌ Промпт не может быть пустым. Попробуйте снова или отправьте /cancel для отмены:")
-        return
-        
-    user_storage.set_profile_setting(message.from_user.id, 'model_prompt', model_prompt)
+    user_storage.set_profile_setting(message.from_user.id, 'model_prompt', message.text.strip())
     await state.clear()
     settings = user_storage.get_active_profile_settings(message.from_user.id)
     await message.answer(
-        "✅ Промпт модели успешно сохранен!\n\n" +
-        get_profile_settings_text(settings),
+        "✅ Промпт сохранен!\n" + get_profile_settings_text(settings),
         reply_markup=get_profile_keyboard(settings),
         parse_mode='HTML'
     )
@@ -700,150 +735,88 @@ async def process_model_prompt(message: types.Message, state: FSMContext):
 async def process_baseurl(message: types.Message, state: FSMContext):
     baseurl = message.text.strip()
     if not baseurl.startswith(('http://', 'https://')):
-        await message.answer("❌ Неверный URL. Убедитесь, что URL начинается с http:// или https://")
+        await message.answer("❌ URL должен начинаться с http:// или https://")
         return
     user_storage.set_profile_setting(message.from_user.id, 'baseurl', baseurl)
     await state.clear()
-    settings = user_storage.get_active_profile_settings(message.from_user.id)
-    await message.answer(
-        get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
-        parse_mode='HTML'
-    )
+    await finish_setting_update(message)
 
 
 @router.message(SettingsStates.apikey)
 async def process_apikey(message: types.Message, state: FSMContext):
-    apikey = message.text.strip()
-    if len(apikey) < 5:
-        await message.answer("❌ API ключ слишком короткий")
-        return
-    user_storage.set_profile_setting(message.from_user.id, 'apikey', apikey)
+    user_storage.set_profile_setting(message.from_user.id, 'apikey', message.text.strip())
     await state.clear()
-    settings = user_storage.get_active_profile_settings(message.from_user.id)
-    await message.answer(
-        get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
-        parse_mode='HTML'
-    )
+    await finish_setting_update(message)
 
 
 @router.message(SettingsStates.model)
 async def process_model(message: types.Message, state: FSMContext):
-    model = message.text.strip()
-    if not model:
-        await message.answer("❌ Название модели не может быть пустым")
-        return
-    user_storage.set_profile_setting(message.from_user.id, 'model', model)
+    user_storage.set_profile_setting(message.from_user.id, 'model', message.text.strip())
     await state.clear()
-    settings = user_storage.get_active_profile_settings(message.from_user.id)
-    await message.answer(
-        get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
-        parse_mode='HTML'
-    )
+    await finish_setting_update(message)
 
 
 @router.message(SettingsStates.max_tokens)
 async def process_max_tokens(message: types.Message, state: FSMContext):
     try:
-        max_tokens = int(message.text.strip())
-        if max_tokens < 100:
-            await message.answer("❌ Количество токенов должно быть не менее 100")
-            return
-        if max_tokens > 60000:
-            await message.answer("❌ Количество токенов должно быть не более 60000")
-            return
+        val = int(message.text.strip())
+        if val < 100 or val > 100000: raise ValueError
     except ValueError:
-        await message.answer("❌ Пожалуйста, введите целое число (например: 2000)")
+        await message.answer("❌ Введите число от 100 до 100000")
         return
-    user_storage.set_profile_setting(message.from_user.id, 'max_tokens', max_tokens)
+    user_storage.set_profile_setting(message.from_user.id, 'max_tokens', val)
     await state.clear()
+    await finish_setting_update(message)
+
+
+async def finish_setting_update(message: types.Message):
     settings = user_storage.get_active_profile_settings(message.from_user.id)
     await message.answer(
         get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
+        reply_markup=get_request_params_keyboard(settings),
         parse_mode='HTML'
     )
 
 
-# Формат ответа и разделение — глобальные, обработка фото — в профиле
+# Toggles
 @router.callback_query(F.data.startswith("format_"))
-async def handle_format_change(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    format_type = callback.data.replace("format_", "")
-    user_storage.set_common_setting(user_id, 'response_format', format_type)
-    settings = user_storage.get_active_profile_settings(user_id)
-    await callback.message.edit_text(
-        get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
-        parse_mode='HTML'
-    )
-    await callback.answer()
-
-
 @router.callback_query(F.data.startswith("split_"))
-async def handle_split_change(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    split_value = callback.data == "split_true"
-    user_storage.set_common_setting(user_id, 'split_response', split_value)
-    settings = user_storage.get_active_profile_settings(user_id)
-    await callback.message.edit_text(
-        get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
-        parse_mode='HTML'
-    )
-    await callback.answer()
-
-
 @router.callback_query(F.data.startswith("photo_"))
-async def handle_photo_processing_change(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    photo_mode = callback.data.replace("photo_", "")
-    user_storage.set_profile_setting(user_id, 'photo_processing', photo_mode)
-    settings = user_storage.get_active_profile_settings(user_id)
-    await callback.message.edit_text(
-        get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
-        parse_mode='HTML'
-    )
-    await callback.answer()
-
-
 @router.callback_query(F.data.startswith("ask_photo_"))
-async def handle_ask_photo_change(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    ask_value = callback.data == "ask_photo_true"
-    user_storage.set_common_setting(user_id, 'ask_before_send_photos', ask_value)
-    settings = user_storage.get_active_profile_settings(user_id)
-    await callback.message.edit_text(
-        get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
-        parse_mode='HTML'
-    )
-    await callback.answer()
-
-
 @router.callback_query(F.data == "show_ask_photo")
-async def show_ask_photo_settings(callback: types.CallbackQuery):
-    settings = user_storage.get_active_profile_settings(callback.from_user.id)
-    await callback.message.edit_text(
-        get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
-        parse_mode='HTML'
-    )
-    await callback.answer()
-
-
 @router.callback_query(F.data == "show_formats")
 @router.callback_query(F.data == "show_split")
-async def refresh_settings(callback: types.CallbackQuery):
-    settings = user_storage.get_active_profile_settings(callback.from_user.id)
-    await callback.message.edit_text(
-        get_profile_settings_text(settings),
-        reply_markup=get_profile_keyboard(settings),
-        parse_mode='HTML'
-    )
+@router.callback_query(F.data == "show_photo_processing")
+async def handle_toggles(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    data = callback.data
+
+    if data.startswith("format_"):
+        user_storage.set_common_setting(user_id, 'response_format', data.replace("format_", ""))
+    elif data.startswith("split_"):
+        user_storage.set_common_setting(user_id, 'split_response', data == "split_true")
+    elif data == "photo_text":
+        user_storage.set_profile_setting(user_id, 'photo_processing', 'text')
+    elif data == "photo_image":
+        user_storage.set_profile_setting(user_id, 'photo_processing', 'image')
+    elif data.startswith("ask_photo_"):
+        user_storage.set_common_setting(user_id, 'ask_before_send_photos', data == "ask_photo_true")
+
+    # Определяем, куда возвращаться - в главное меню или в параметры запроса
+    # Проверяем текущее сообщение - если там клавиатура параметров, возвращаемся туда
+    settings = user_storage.get_active_profile_settings(user_id)
+    
+    # По умолчанию возвращаемся в главное меню настроек
+    keyboard = get_profile_keyboard(settings)
+
+    try:
+        await callback.message.edit_text(
+            get_profile_settings_text(settings),
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
     await callback.answer()
 
 
@@ -853,259 +826,266 @@ async def handle_close_settings(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# ————————————————————————————————————————————————————————
-# Обработка фото и текста (с новой функцией сессий)
-# ————————————————————————————————————————————————————————
-
 @router.message(Command("show_settings"))
 async def cmd_show_settings(message: types.Message):
     settings = user_storage.get_active_profile_settings(message.from_user.id)
     if not settings.get('baseurl'):
-        await message.answer("❌ Настройки не найдены. Используйте /settings для настройки бота.")
+        await message.answer("❌ Сначала настройте бот: /settings")
         return
     await message.answer(get_profile_settings_text(settings), parse_mode='HTML')
 
 
 @router.message(Command("delete_settings"))
 async def cmd_delete_settings(message: types.Message):
-    settings = user_storage.get_active_profile_settings(message.from_user.id)
-    if not settings:
-        await message.answer("❌ Настройки не найдены.")
-        return
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [
-            types.InlineKeyboardButton(text="✅ Да, удалить", callback_data="confirm_delete"),
-            types.InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_delete")
-        ]
+        [types.InlineKeyboardButton(text="✅ Удалить", callback_data="confirm_delete"),
+         types.InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_delete")]
     ])
-    await message.answer("⚠️ Вы уверены, что хотите удалить свои настройки?", reply_markup=keyboard)
+    await message.answer("⚠️ Удалить все ваши настройки?", reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "confirm_delete")
 async def confirm_delete(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    user_data = user_storage.get_user_data(user_id)
-    # Удаляем всё
     users = user_storage.load_users()
     users.pop(str(user_id), None)
     user_storage.save_users(users)
-    await callback.message.edit_text("✅ Настройки успешно удалены!")
+    await callback.message.edit_text("✅ Настройки удалены")
     await callback.answer()
 
 
 @router.callback_query(F.data == "cancel_delete")
 async def cancel_delete(callback: types.CallbackQuery):
-    await callback.message.edit_text("❌ Удаление отменено.")
+    await callback.message.edit_text("❌ Отменено")
     await callback.answer()
 
+
+# ————————————————————————————————————————————————————————
+# File / Document Processing
+# ————————————————————————————————————————————————————————
+
+@router.message(F.document)
+async def handle_document(message: types.Message):
+    user_id = message.from_user.id
+    settings = user_storage.get_active_profile_settings(user_id)
+    
+    if not settings.get('baseurl'):
+        await message.answer("❌ Сначала настройте бот: /settings")
+        return
+
+    doc = message.document
+    
+    # 1. Проверяем, является ли документ изображением (отправленным как файл)
+    if doc.mime_type and doc.mime_type.startswith('image/'):
+        # Обрабатываем как картинку
+        processing_msg = await message.answer(f"📥 Скачиваю изображение «{doc.file_name}»...")
+        try:
+            file = await bot.get_file(doc.file_id)
+            image_bytes = await bot.download_file(file.file_path)
+            
+            caption = message.caption or ""
+            
+            # Создаем структуру, совместимую с функцией обработки фото
+            photo_data = [{'file_id': doc.file_id, 'caption': caption}]
+            
+            # Если настройки обработки фото стоят на 'text' (OCR), используем OCR
+            # Если 'image' (Vision) - используем Vision
+            if settings.get('photo_processing') == 'image':
+                # Для Vision нужно base64
+                image_base64 = base64.b64encode(image_bytes.read()).decode('utf-8')
+                await processing_msg.edit_text(f"🔄 Анализирую изображение через {settings['model']}...")
+                prompt = caption or "Что изображено на этом файле?"
+                response_text = await send_image_to_api(settings, image_base64, prompt)
+                await processing_msg.delete()
+                await send_response(message.chat.id, response_text, settings)
+            else:
+                # OCR для файла-картинки
+                text = await ocr_space_api(image_bytes, doc.file_name)
+                await processing_msg.edit_text(f"🔄 Модель обрабатывает текст из файла...")
+                full_prompt = f"Текст из файла {doc.file_name}:\n{text}\n\nЗапрос: {caption}"
+                response_text = await send_to_chatgpt(settings, full_prompt)
+                await processing_msg.delete()
+                await send_response(message.chat.id, response_text, settings)
+                
+        except Exception as e:
+            await processing_msg.edit_text(f"❌ Ошибка обработки файла-изображения: {str(e)}")
+        return
+
+    # 2. Обрабатываем текстовые файлы
+    processing_msg = await message.answer(f"📥 Читаю файл «{doc.file_name}»...")
+    
+    if doc.file_size > 5 * 1024 * 1024: # Ограничение 5 МБ для текста
+        await processing_msg.edit_text("❌ Файл слишком большой для текстового анализа (макс 5 МБ).")
+        return
+
+    try:
+        file = await bot.get_file(doc.file_id)
+        file_content = await bot.download_file(file.file_path)
+        
+        # Пытаемся декодировать как текст
+        try:
+            text_content = file_content.read().decode('utf-8')
+        except UnicodeDecodeError:
+            await processing_msg.edit_text("❌ Не удалось прочитать файл как текст (бинарный файл или неверная кодировка).")
+            return
+
+        # Формируем промпт
+        user_query = message.caption or "Проанализируй этот файл."
+        prompt = (
+            f"Пользователь прислал файл: {doc.file_name}\n"
+            f"Содержимое файла:\n"
+            f"```\n{text_content}\n```\n\n"
+            f"Запрос пользователя к этому файлу: {user_query}"
+        )
+
+        await processing_msg.edit_text(f"🔄 Отправляю содержимое файла в {settings['model']}...")
+        response_text = await send_to_chatgpt(settings, prompt)
+        
+        await processing_msg.delete()
+        await send_response(message.chat.id, response_text, settings)
+
+    except Exception as e:
+        logger.error(f"Error handling file: {e}")
+        await processing_msg.edit_text(f"❌ Ошибка при чтении файла: {str(e)}")
+
+
+# ————————————————————————————————————————————————————————
+# Photo Processing
+# ————————————————————————————————————————————————————————
 
 @router.message(F.photo)
 async def handle_photos(message: types.Message):
     user_id = message.from_user.id
     settings = user_storage.get_active_profile_settings(user_id)
     if not settings.get('baseurl'):
-        await message.answer("❌ Сначала настройте бот с помощью команды /settings")
+        await message.answer("❌ Сначала настройте бот: /settings")
         return
     
-    # Проверяем настройку: нужно ли спрашивать перед отправкой
     ask_before_send = settings.get('ask_before_send_photos', True)
     
-    # Добавляем фото в сессию
-    if user_id not in user_sessions:
-        user_sessions[user_id] = {
-            'photos': [],
-            'last_message_id': None,
-            'media_group_id': None
-        }
+    if user_id not in photo_sessions:
+        photo_sessions[user_id] = {'photos': [], 'last_message_id': None}
     
-    file_id = message.photo[-1].file_id
-    caption = message.caption or ""
-    
-    user_sessions[user_id]['photos'].append({
-        'file_id': file_id,
-        'caption': caption
+    photo_sessions[user_id]['photos'].append({
+        'file_id': message.photo[-1].file_id,
+        'caption': message.caption or ""
     })
     
-    # Если настройка выключена (auto_send = True), отправляем сразу
     if not ask_before_send:
-        # Небольшая задержка для сбора всех фото из альбома (если это альбом)
         await asyncio.sleep(0.5)
-        
-        # Проверяем, не пришло ли еще фото (для альбомов Telegram отправляет их почти одновременно)
-        # Даем еще немного времени
         await asyncio.sleep(0.5)
-        
-        # Отправляем на обработку
-        photo_data = user_sessions[user_id]['photos'].copy()
-        user_sessions.pop(user_id, None)  # Очищаем сессию
-        
+        photo_data = photo_sessions[user_id]['photos'].copy()
+        photo_sessions.pop(user_id, None)
         await process_photo_session(message.chat.id, user_id, photo_data, settings)
         return
     
-    # Если настройка включена - показываем кнопки подтверждения (старое поведение)
-    total_photos = len(user_sessions[user_id]['photos'])
+    total_photos = len(photo_sessions[user_id]['photos'])
     confirmation_text = f"📸 В сумме {total_photos} фото, начать обработку?"
-    
     keyboard = get_album_confirmation_keyboard()
     
-    if user_sessions[user_id]['last_message_id']:
+    if photo_sessions[user_id]['last_message_id']:
         try:
             await bot.edit_message_text(
                 chat_id=message.chat.id,
-                message_id=user_sessions[user_id]['last_message_id'],
+                message_id=photo_sessions[user_id]['last_message_id'],
                 text=confirmation_text,
                 reply_markup=keyboard
             )
         except Exception:
-            # Если не удалось редактировать, отправляем новое сообщение
             new_message = await message.answer(confirmation_text, reply_markup=keyboard)
-            user_sessions[user_id]['last_message_id'] = new_message.message_id
+            photo_sessions[user_id]['last_message_id'] = new_message.message_id
     else:
         new_message = await message.answer(confirmation_text, reply_markup=keyboard)
-        user_sessions[user_id]['last_message_id'] = new_message.message_id
+        photo_sessions[user_id]['last_message_id'] = new_message.message_id
 
 
 @router.callback_query(F.data == "album_send")
 async def handle_album_send(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    
-    if user_id not in user_sessions or not user_sessions[user_id]['photos']:
-        await callback.answer("❌ Нет фото для обработки")
+    if user_id not in photo_sessions or not photo_sessions[user_id]['photos']:
+        await callback.answer("❌ Нет фото")
         return
-    
-    # Удаляем сообщение с кнопками
     await callback.message.delete()
-    
-    # Обрабатываем фото
     settings = user_storage.get_active_profile_settings(user_id)
-    photo_data = user_sessions[user_id]['photos']
-    
-    # Очищаем сессию
-    user_sessions.pop(user_id, None)
-    
+    photo_data = photo_sessions[user_id]['photos']
+    photo_sessions.pop(user_id, None)
     await process_photo_session(callback.message.chat.id, user_id, photo_data, settings)
 
 
 @router.callback_query(F.data == "album_cancel")
 async def handle_album_cancel(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    
-    if user_id in user_sessions:
-        user_sessions.pop(user_id, None)
-    
-    await callback.message.edit_text("❌ Обработка фото отменена")
+    if user_id in photo_sessions: photo_sessions.pop(user_id, None)
+    await callback.message.edit_text("❌ Отменено")
     await callback.answer()
 
 
 async def process_photo_session(chat_id: int, user_id: int, photo_data: List[dict], settings: dict):
-    """Обрабатывает сессию с фото"""
     processing_msg = await bot.send_message(chat_id, f"🔄 Обрабатываю {len(photo_data)} фото...")
-    
     try:
-        photo_processing_mode = settings.get('photo_processing', 'text')
-        
-        if photo_processing_mode == 'text':
-            # Режим OCR - обрабатываем все фото
+        if settings.get('photo_processing', 'text') == 'text':
             await process_photos_as_text(chat_id, user_id, photo_data, settings, processing_msg)
         else:
-            # Режим Vision - обрабатываем только первое фото (ограничение API)
             await process_photos_as_image(chat_id, user_id, photo_data, settings, processing_msg)
-            
     except Exception as e:
-        logger.error(f"Ошибка при обработке сессии фото: {str(e)}", exc_info=True)
-        await processing_msg.edit_text(f"❌ Ошибка при обработке фото: {str(e)}")
+        logger.error(f"Error processing photos: {e}")
+        await processing_msg.edit_text(f"❌ Ошибка: {str(e)}")
 
 
 async def process_photos_as_text(chat_id: int, user_id: int, photo_data: List[dict], settings: dict, processing_msg: types.Message):
-    """Обработка фото через OCR"""
     all_texts = []
-    
     for i, photo_info in enumerate(photo_data, 1):
         try:
             file = await bot.get_file(photo_info['file_id'])
             image_bytes = await bot.download_file(file.file_path)
             text = await ocr_space_api(image_bytes, f'image_{i}.jpg')
             if text.strip():
-                caption_text = f" (подпись: {photo_info['caption']})" if photo_info['caption'] else ""
-                all_texts.append(f"--- Текст с изображения {i}{caption_text} ---\n{text}")
-        except Exception as e:
-            logger.error(f"Ошибка при обработке фото {i}: {str(e)}")
+                caption = f" (подпись: {photo_info['caption']})" if photo_info['caption'] else ""
+                all_texts.append(f"--- Текст с фото {i}{caption} ---\n{text}")
+        except Exception:
             continue
     
     if not all_texts:
-        await processing_msg.edit_text("❌ Не удалось распознать текст ни с одного изображения")
+        await processing_msg.edit_text("❌ Не удалось распознать текст")
         return
     
     combined_text = "\n".join(all_texts)
     await processing_msg.edit_text(f"🔄 Модель {settings['model']} генерирует ответ...")
-    
     response_text = await send_to_chatgpt(settings, combined_text)
     await processing_msg.delete()
-    await send_response(chat_id, response_text, settings, len(all_texts))
+    await send_response(chat_id, response_text, settings)
 
 
 async def process_photos_as_image(chat_id: int, user_id: int, photo_data: List[dict], settings: dict, processing_msg: types.Message):
-    """Обработка фото как изображений (только первое фото)"""
-    if not photo_data:
-        await processing_msg.edit_text("❌ Нет фото для обработки")
-        return
-    
-    # Берем только первое фото (ограничение API)
+    if not photo_data: return
     first_photo = photo_data[0]
-    
     try:
         file = await bot.get_file(first_photo['file_id'])
         image_bytes = await bot.download_file(file.file_path)
-        
-        if not image_bytes:
-            await processing_msg.edit_text("❌ Не удалось скачать изображение")
-            return
-        
-        # Кодируем в base64
         image_base64 = base64.b64encode(image_bytes.read()).decode('utf-8')
-        
         prompt = first_photo['caption'] or "Что изображено на фото?"
-        
-        await processing_msg.edit_text(f"🔄 Модель {settings['model']} анализирует изображение...")
-        
-        # Отправляем в API
+        await processing_msg.edit_text(f"🔄 Анализ изображения ({settings['model']})...")
         response_text = await send_image_to_api(settings, image_base64, prompt)
-        
         await processing_msg.delete()
         await send_response(chat_id, response_text, settings)
-        
     except Exception as e:
-        logger.error(f"Ошибка при обработке фото как изображения: {str(e)}", exc_info=True)
-        await processing_msg.edit_text(f"❌ Ошибка при обработке изображения: {str(e)}")
+        await processing_msg.edit_text(f"❌ Ошибка: {str(e)}")
 
 
-async def send_response(chat_id: int, response_text: str, settings: dict, image_count: int = None):
-    prefix = ""
-    if image_count and image_count > 1:
-        #prefix = f"(распознано с {image_count} изображений)\n"
-        prefix = ""
-    full_text = prefix + response_text
-    if settings.get('split_response', False) and len(full_text) > 390:
-        chunks = []
-        current_chunk = ""
-        for char in full_text:
-            if len(current_chunk) < 390:
-                current_chunk += char
-            else:
-                chunks.append(current_chunk)
-                current_chunk = char
-        if current_chunk:
-            chunks.append(current_chunk)
-        total_parts = len(chunks)
+async def send_response(chat_id: int, response_text: str, settings: dict):
+    if settings.get('split_response', False) and len(response_text) > 390:
+        chunks = [response_text[i:i+390] for i in range(0, len(response_text), 390)]
         for i, chunk in enumerate(chunks, 1):
-            part_text = f"{i}/{total_parts}\n{chunk}"
-            await bot.send_message(chat_id, part_text)
+            await bot.send_message(chat_id, f"{i}/{len(chunks)}\n{chunk}")
             await asyncio.sleep(4)
     else:
-        await bot.send_message(chat_id, full_text)
+        await bot.send_message(chat_id, response_text)
 
 
 async def ocr_space_api(image_bytes: bytes, filename: str) -> str:
+    # Важно: bytes object должен быть в начале (seek 0) если он был прочитан
+    if hasattr(image_bytes, 'seek'): image_bytes.seek(0)
+    
     url = "https://api.ocr.space/parse/image"
     form_data = aiohttp.FormData()
     form_data.add_field('file', image_bytes, filename=filename, content_type='image/jpeg')
@@ -1113,35 +1093,25 @@ async def ocr_space_api(image_bytes: bytes, filename: str) -> str:
     form_data.add_field('language', 'rus')
     form_data.add_field('isOverlayRequired', 'false')
     form_data.add_field('OCREngine', '2')
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession() as session:
         async with session.post(url, data=form_data) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(f"OCR API error {response.status}: {error_text}")
             result = await response.json()
-            if result.get('IsErroredOnProcessing', False):
-                error_message = result.get('ErrorMessage', ['Unknown error'])
-                if isinstance(error_message, list):
-                    error_message = error_message[0]
-                raise Exception(f"OCR processing error: {error_message}")
-            parsed_results = result.get('ParsedResults', [])
-            if not parsed_results:
-                raise Exception("No text found in image")
-            parsed_text = parsed_results[0].get('ParsedText', '')
-            if not parsed_text.strip():
-                raise Exception("No text found in image")
-            return parsed_text
+            if result.get('IsErroredOnProcessing', False): raise Exception(result.get('ErrorMessage', ['Error'])[0])
+            parsed = result.get('ParsedResults', [])
+            return parsed[0].get('ParsedText', '') if parsed else ""
 
+
+# ————————————————————————————————————————————————————————
+# Text Handling
+# ————————————————————————————————————————————————————————
 
 @router.message(F.text)
 async def handle_text_message(message: types.Message):
-    if message.text.startswith('/'):
-        return
+    if message.text.startswith('/'): return
     user_id = message.from_user.id
     settings = user_storage.get_active_profile_settings(user_id)
     if not settings.get('baseurl'):
-        await message.answer("❌ Сначала настройте бот с помощью команды /settings")
+        await message.answer("❌ Сначала настройте бот: /settings")
         return
     processing_msg = await message.answer(f"🔄 Модель {settings['model']} генерирует ответ...")
     try:
@@ -1150,167 +1120,298 @@ async def handle_text_message(message: types.Message):
         await send_response(message.chat.id, response_text, settings)
     except Exception as e:
         await processing_msg.delete()
-        logger.error(f"Ошибка при обращении к ChatGPT: {str(e)}")
         await message.answer(f"❌ Ошибка: {str(e)}")
 
 
-async def send_to_perplexity(settings: dict, message: str) -> str:
-    url = "https://api.perplexity.ai/chat/completions"
-    system_prompt = "Be precise and concise. Answer in Russian. Do not use markdown formatting."
-    
-    # Добавляем промпт модели если есть
-    model_prompt = settings.get('model_prompt', '')
-    if model_prompt:
-        system_prompt = f"{model_prompt}. {system_prompt}"
-    
-    response_format = settings.get('response_format', 'normal')
-    if response_format == 'medium':
-        system_prompt += " Provide brief explanations only."
-    elif response_format == 'short':
-        system_prompt += " Provide direct answers only, no explanations."
-    max_tokens = settings.get('max_tokens', 1200)
-    data = {
-        "model": settings['model'],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message}
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.3,
-        "stream": False
-    }
-    headers = {
-        "Authorization": f"Bearer {settings['apikey']}",
-        "Content-Type": "application/json"
-    }
-    timeout = aiohttp.ClientTimeout(total=300)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, headers=headers, json=data) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(f"Perplexity API ошибка {response.status}: {error_text}")
-            result = await response.json()
-            response_text = result['choices'][0]['message']['content']
-            return remove_think_tags(response_text)
 
+@router.message(F.video)
+async def handle_video_message(message: types.Message):
+    """
+    Принимает видео и отправляет его напрямую в API в виде base64.
+    Caption учитывается как промпт. Системный промпт и настройки профиля применяются.
+    """
+    user_id = message.from_user.id
+    settings = user_storage.get_active_profile_settings(user_id)
 
-async def send_image_to_api(settings: dict, image_base64: str, prompt: str) -> str:
-    """Отправка изображения в API в формате base64"""
-    if "perplexity.ai" in settings['baseurl']:
-        # Perplexity не поддерживает изображения, используем текстовый режим
-        return await send_to_perplexity(settings, prompt)
-    
-    url = f"{settings['baseurl']}/chat/completions"
-    
-    system_prompt = "Не используй разметку markdown в ответах. Начни отвечать сразу с ответа на вопросы."
-    
-    # Добавляем промпт модели если есть
-    model_prompt = settings.get('model_prompt', '')
-    if model_prompt:
-        system_prompt = f"{model_prompt}. {system_prompt}"
-    
-    response_format = settings.get('response_format', 'normal')
-    if response_format == 'medium':
-        system_prompt += " Не пиши объемный ответ, только вкратце объясни его."
-    elif response_format == 'short':
-        system_prompt += " Пиши только ответы, без объяснения."
-    
-    max_tokens = settings.get('max_tokens', 2000)
-    
-    data = {
-        "model": settings['model'],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user", 
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_base64}",
-                            "detail": "auto"
-                        }
-                    }
-                ]
-            }
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.7
-    }
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {settings['apikey']}"
-    }
-    
-    timeout = aiohttp.ClientTimeout(total=300)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, headers=headers, json=data) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(f"API ошибка {response.status}: {error_text}")
-            result = await response.json()
-            response_text = result['choices'][0]['message']['content']
-            return remove_think_tags(response_text)
+    if not settings.get('baseurl'):
+        await message.answer("❌ Сначала настройте бот: /settings")
+        return
 
+    video = message.video
+    file_size_mb = (video.file_size or 0) / (1024 * 1024)
 
-async def send_to_chatgpt(settings: dict, message: str) -> str:
-    if "perplexity.ai" in settings['baseurl']:
-        return await send_to_perplexity(settings, message)
-    else:
-        url = f"{settings['baseurl']}/chat/completions"
-        system_prompt = "Не используй разметку markdown в ответах. Начни отвечать сразу с ответа на вопросы."
-        
-        # Добавляем промпт модели если есть
-        model_prompt = settings.get('model_prompt', '')
-        if model_prompt:
-            system_prompt = f"{model_prompt}. {system_prompt}"
-        
-        response_format = settings.get('response_format', 'normal')
-        if response_format == 'medium':
-            system_prompt += " Не пиши объемный ответ, только вкратце объясни его."
-        elif response_format == 'short':
-            system_prompt += " Пиши только ответы, без объяснения."
-        max_tokens = settings.get('max_tokens', 2000)
-        data = {
-            "model": settings['model'],
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message}
-            ],
-            "max_tokens": max_tokens,
-            "temperature": 0.7
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {settings['apikey']}"
-        }
-        timeout = aiohttp.ClientTimeout(total=300)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=headers, json=data) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise Exception(f"API ошибка {response.status}: {error_text}")
-                result = await response.json()
-                response_text = result['choices'][0]['message']['content']
-                return remove_think_tags(response_text)
+    if file_size_mb > 20:
+        await message.answer(
+            f"❌ Видео слишком большое ({file_size_mb:.1f} МБ). Максимум — 20 МБ."
+        )
+        return
 
+    processing_msg = await message.answer(f"🎬 Скачиваю видео ({file_size_mb:.1f} МБ)...")
+
+    try:
+        file = await bot.get_file(video.file_id)
+        file_io = io.BytesIO()
+        await bot.download_file(file.file_path, file_io)
+        file_io.seek(0)
+
+        await processing_msg.edit_text("🔄 Кодирую видео и отправляю в модель...")
+
+        video_base64 = base64.b64encode(file_io.read()).decode('utf-8')
+        mime_type = video.mime_type or "video/mp4"
+        user_caption = message.caption or "Опиши, что происходит в этом видео."
+
+        await processing_msg.edit_text(f"🤖 Модель {settings['model']} анализирует видео...")
+
+        response_text = await send_video_to_api(settings, video_base64, user_caption, mime_type)
+
+        await processing_msg.delete()
+        await send_response(message.chat.id, response_text, settings)
+
+    except Exception as e:
+        logger.error(f"Video error: {e}")
+        await processing_msg.edit_text(f"❌ Ошибка обработки видео: {str(e)}")
+# -----------------------------------------------
+
+# ————————————————————————————————————————————————————————
+# API Clients
+# ————————————————————————————————————————————————————————
 
 def remove_think_tags(text: str) -> str:
     import re
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'<think>.*', '', text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'\n\s*\n', '\n', text)
-    text = text.strip()
-    if not text:
-        return "Ответ был удален, так как содержал только служебную информацию в тегах <think>"
-    return text
+    return text.strip() or "Ответ был удален (только <think>)"
+
+
+async def send_to_perplexity(settings: dict, message: str) -> str:
+    url = "https://api.perplexity.ai/chat/completions"
+    sys_prompt = f"{settings.get('model_prompt', '')}. Запрещается использовать markdown и прочую разметку, не добавляй эмодзи."
+    if settings.get('response_format') == 'short': sys_prompt += " No explanations."
+    
+    user_id = settings.get('_user_id')
+    if user_id and user_id not in user_sessions:
+        user_sessions[user_id] = []
+        
+    messages_payload = [{"role": "system", "content": sys_prompt}]
+    if user_id:
+        messages_payload.extend(user_sessions[user_id])
+    messages_payload.append({"role": "user", "content": message})
+    
+    data = {
+        "model": settings['model'],
+        "messages": messages_payload,
+        "max_tokens": settings.get('max_tokens', 1200),
+        "temperature": 0.3
+    }
+    headers = {"Authorization": f"Bearer {settings['apikey']}", "Content-Type": "application/json"}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=data) as response:
+            if response.status != 200: raise Exception(await response.text())
+            result = await response.json()
+            content = remove_think_tags(result['choices'][0]['message']['content'])
+            
+            if user_id:
+                user_sessions[user_id].append({"role": "user", "content": message})
+                user_sessions[user_id].append({"role": "assistant", "content": content})
+                if len(user_sessions[user_id]) > 40:
+                    user_sessions[user_id] = user_sessions[user_id][-40:]
+                    
+            return content
 
 
 # ————————————————————————————————————————————————————————
-# Запуск
+# API Clients (Обновленные)
 # ————————————————————————————————————————————————————————
+
+async def send_to_chatgpt(settings: dict, message: str) -> str:
+    # Если это Perplexity, перенаправляем (функцию send_to_perplexity можно оставить как есть или обновить аналогично)
+    if "perplexity.ai" in settings['baseurl']: 
+        return await send_to_perplexity(settings, message)
+    
+    url = f"{settings['baseurl']}/chat/completions"
+    
+    # Логика формирования системного промпта
+    format_type = settings.get('response_format', 'normal')
+    base_sys = settings.get('model_prompt', '')
+    
+    # Жесткие инструкции в зависимости от режима
+    if format_type == 'short':
+        sys_instruction = "Запрещается использовать markdown и прочую разметку, не добавляй эмодзи. Твоя задача — отвечать МАКСИМАЛЬНО кратко. Исключи любые вступления, пояснения и вежливость. Сразу суть и сухие факты."
+    elif format_type == 'medium':
+        sys_instruction = "Запрещается использовать markdown и прочую разметку, не добавляй эмодзи. Отвечай лаконично и по делу. Избегай длинных философских рассуждений. Только конкретика. Слишком длинные ответы не приветсвуются."
+    else:
+        sys_instruction = "Запрещается использовать markdown и прочую разметку, не добавляй эмодзи."
+
+    # Объединяем пользовательский промпт и настройки режима
+    full_sys_prompt = f"{sys_instruction} {base_sys}".strip()
+    
+    # Для режима 'short' можно дополнительно урезать max_tokens, чтобы физически ограничить модель
+    # Но лучше полагаться на промпт, чтобы не обрывать слова.
+    
+    user_id = settings.get('_user_id')
+    if user_id and user_id not in user_sessions:
+        user_sessions[user_id] = []
+        
+    messages_payload = [{"role": "system", "content": full_sys_prompt}]
+    if user_id:
+        messages_payload.extend(user_sessions[user_id])
+    messages_payload.append({"role": "user", "content": message})
+    
+    data = {
+        "model": settings['model'],
+        "messages": messages_payload,
+        "max_tokens": settings.get('max_tokens', 2000),
+        "temperature": 0.5 if format_type == 'short' else 0.7 # Понижаем температуру для коротких ответов (меньше креатива, больше четкости)
+    }
+    
+    headers = {
+        "Content-Type": "application/json", 
+        "Authorization": f"Bearer {settings['apikey']}"
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=data) as response:
+            if response.status != 200: 
+                error_text = await response.text()
+                raise Exception(f"API Error {response.status}: {error_text}")
+            
+            result = await response.json()
+            content = result['choices'][0]['message']['content']
+            clean_content = remove_think_tags(content)
+            
+            if user_id:
+                user_sessions[user_id].append({"role": "user", "content": message})
+                user_sessions[user_id].append({"role": "assistant", "content": clean_content})
+                if len(user_sessions[user_id]) > 40:
+                    user_sessions[user_id] = user_sessions[user_id][-40:]
+            
+            return clean_content
+
+
+async def send_image_to_api(settings: dict, image_base64: str, prompt: str) -> str:
+    if "perplexity.ai" in settings['baseurl']: 
+        return await send_to_perplexity(settings, prompt)
+    
+    url = f"{settings['baseurl']}/chat/completions"
+    
+    format_type = settings.get('response_format', 'normal')
+    base_sys = settings.get('model_prompt', '')
+    
+    # Те же жесткие инструкции для картинок
+    if format_type == 'short':
+        sys_instruction = "Проанализируй изображение и ответь ОЧЕНЬ кратко. Только суть. Запрещается использовать markdown и прочую разметку, не добавляй эмодзи."
+    elif format_type == 'medium':
+        sys_instruction = "Отвечай по делу, без лишней воды. Запрещается использовать markdown и прочую разметку, не добавляй эмодзи."
+    else:
+        sys_instruction = "Запрещается использовать markdown и прочую разметку, не добавляй эмодзи."
+
+    full_sys_prompt = f"{sys_instruction} {base_sys}".strip()
+
+    user_id = settings.get('_user_id')
+    if user_id and user_id not in user_sessions:
+        user_sessions[user_id] = []
+        
+    messages_payload = [{"role": "system", "content": full_sys_prompt}]
+    if user_id:
+        messages_payload.extend(user_sessions[user_id])
+    messages_payload.append({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+        ]
+    })
+
+    data = {
+        "model": settings['model'],
+        "messages": messages_payload,
+        "max_tokens": settings.get('max_tokens', 2000),
+        "temperature": 0.5 if format_type == 'short' else 0.7
+    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {settings['apikey']}"}
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=data) as response:
+            if response.status != 200: 
+                error_text = await response.text()
+                raise Exception(f"API Error {response.status}: {error_text}")
+            
+            result = await response.json()
+            content = result['choices'][0]['message']['content']
+            clean_content = remove_think_tags(content)
+            
+            if user_id:
+                user_sessions[user_id].append({"role": "user", "content": f"[User sent an image]: {prompt}"})
+                user_sessions[user_id].append({"role": "assistant", "content": clean_content})
+                if len(user_sessions[user_id]) > 40:
+                    user_sessions[user_id] = user_sessions[user_id][-40:]
+                    
+            return clean_content
+        
+async def send_video_to_api(settings: dict, video_base64: str, prompt: str, mime_type: str = "video/mp4") -> str:
+    """
+    Отправляет видео в API как base64. Системный промпт из настроек профиля (model_prompt + format).
+    Caption передаётся как пользовательский промпт.
+    Работает с моделями, поддерживающими video input (например, Gemini через OpenAI-endpoint).
+    """
+    if "perplexity.ai" in settings['baseurl']:
+        return await send_to_perplexity(settings, prompt)
+
+    url = f"{settings['baseurl']}/chat/completions"
+    format_type = settings.get('response_format', 'normal')
+    base_sys = settings.get('model_prompt', '')
+
+    if format_type == 'short':
+        sys_instruction = "Проанализируй видео и ответь ОЧЕНЬ кратко. Только суть. Запрещается использовать markdown и прочую разметку, не добавляй эмодзи."
+    elif format_type == 'medium':
+        sys_instruction = "Отвечай по делу, без лишней воды. Запрещается использовать markdown и прочую разметку, не добавляй эмодзи."
+    else:
+        sys_instruction = "Запрещается использовать markdown и прочую разметку, не добавляй эмодзи."
+
+    full_sys_prompt = f"{sys_instruction} {base_sys}".strip()
+
+    user_id = settings.get('_user_id')
+    if user_id and user_id not in user_sessions:
+        user_sessions[user_id] = []
+        
+    messages_payload = [{"role": "system", "content": full_sys_prompt}]
+    if user_id:
+        messages_payload.extend(user_sessions[user_id])
+    messages_payload.append({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{video_base64}"}}
+        ]
+    })
+
+    data = {
+        "model": settings['model'],
+        "messages": messages_payload,
+        "max_tokens": settings.get('max_tokens', 2000),
+        "temperature": 0.5 if format_type == 'short' else 0.7
+    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {settings['apikey']}"}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=data) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(f"API Error {response.status}: {error_text}")
+            result = await response.json()
+            content = result['choices'][0]['message']['content']
+            clean_content = remove_think_tags(content)
+            
+            if user_id:
+                user_sessions[user_id].append({"role": "user", "content": f"[User sent a video]: {prompt}"})
+                user_sessions[user_id].append({"role": "assistant", "content": clean_content})
+                if len(user_sessions[user_id]) > 40:
+                    user_sessions[user_id] = user_sessions[user_id][-40:]
+                    
+            return clean_content
+
 
 async def main():
     logger.info("Бот запущен")
