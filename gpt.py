@@ -82,7 +82,8 @@ class UserStorage:
                         'model': old_settings.get('model'),
                         'max_tokens': old_settings.get('max_tokens', 2000),
                         'photo_processing': old_settings.get('photo_processing', 'text'),
-                        'model_prompt': old_settings.get('model_prompt', '')
+                        'model_prompt': old_settings.get('model_prompt', ''),
+                        'thinking_budget': old_settings.get('thinking_budget', 'off')
                     }
                 },
                 'active_profile': 'default',
@@ -157,7 +158,8 @@ class UserStorage:
             'model': '',
             'max_tokens': 2000,
             'photo_processing': 'text',
-            'model_prompt': ''
+            'model_prompt': '',
+            'thinking_budget': 'off'
         }
         self.set_user_data(user_id, user_data)
 
@@ -243,6 +245,13 @@ def get_profile_settings_text(settings: Dict[str, Any]) -> str:
     model_prompt = settings.get('model_prompt', '')
     model_prompt_text = f"{model_prompt[:50]}..." if len(model_prompt) > 50 else model_prompt if model_prompt else "Не установлен"
     
+    thinking_budget_text = {
+        'off': '❌ Выключено',
+        'low': '🔹 Низкое (1024)',
+        'medium': '🔶 Среднее (8192)',
+        'high': '🔴 Высокое (24576)'
+    }.get(settings.get('thinking_budget', 'off'), '❌ Выключено')
+    
     settings_text = (
         f"⚙️ <b>Текущие настройки:</b>\n"
         f"👤 Профиль: {settings.get('_active_profile_name', '—')}\n"
@@ -254,6 +263,7 @@ def get_profile_settings_text(settings: Dict[str, Any]) -> str:
         f"📋 Разделение ответа: {split_text}\n"
         f"🖼️ Принять фото как: {photo_processing_text}\n"
         f"📸 Подтверждение отправки фото: {ask_before_send_text}\n"
+        f"🧠 Глубина мышления: {thinking_budget_text}\n"
         f"💬 Промпт модели: {model_prompt_text}\n"
         f"Выберите параметр для изменения:"
     )
@@ -308,6 +318,7 @@ def get_profile_keyboard(settings: Dict[str, Any]) -> types.InlineKeyboardMarkup
 
 def get_request_params_keyboard(settings: Dict[str, Any]) -> types.InlineKeyboardMarkup:
     photo_processing = settings.get('photo_processing', 'text')
+    thinking_budget = settings.get('thinking_budget', 'off')
     
     photo_buttons = [
         [
@@ -323,6 +334,15 @@ def get_request_params_keyboard(settings: Dict[str, Any]) -> types.InlineKeyboar
         ]
     ]
 
+    thinking_buttons = [
+        [
+            types.InlineKeyboardButton(text=f"{'✅' if thinking_budget == 'off' else '○'} Выкл", callback_data="thinking_off"),
+            types.InlineKeyboardButton(text=f"{'✅' if thinking_budget == 'low' else '○'} Низкое", callback_data="thinking_low"),
+            types.InlineKeyboardButton(text=f"{'✅' if thinking_budget == 'medium' else '○'} Среднее", callback_data="thinking_medium"),
+            types.InlineKeyboardButton(text=f"{'✅' if thinking_budget == 'high' else '○'} Высокое", callback_data="thinking_high"),
+        ]
+    ]
+
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="🔗 Изменить Base URL", callback_data="change_baseurl")],
         [types.InlineKeyboardButton(text="🔑 Изменить API ключ", callback_data="change_apikey")],
@@ -332,6 +352,8 @@ def get_request_params_keyboard(settings: Dict[str, Any]) -> types.InlineKeyboar
         *photo_buttons,
         [types.InlineKeyboardButton(text="📸 Подтверждение отправки фото", callback_data="show_ask_photo")],
         *ask_photo_buttons,
+        [types.InlineKeyboardButton(text="🧠 Глубина мышления", callback_data="show_thinking")],
+        *thinking_buttons,
         [types.InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_settings")]
     ])
     return keyboard
@@ -803,6 +825,9 @@ async def handle_toggles(callback: types.CallbackQuery):
         user_storage.set_profile_setting(user_id, 'photo_processing', 'image')
     elif data.startswith("ask_photo_"):
         user_storage.set_common_setting(user_id, 'ask_before_send_photos', data == "ask_photo_true")
+    elif data.startswith("thinking_"):
+        level = data.replace("thinking_", "")  # off / low / medium / high
+        user_storage.set_profile_setting(user_id, 'thinking_budget', level)
 
     # Определяем, куда возвращаться - в главное меню или в параметры запроса
     # Проверяем текущее сообщение - если там клавиатура параметров, возвращаемся туда
@@ -1186,6 +1211,33 @@ def remove_think_tags(text: str) -> str:
     return text.strip() or "Ответ был удален (только <think>)"
 
 
+def get_thinking_config(settings: dict) -> dict | None:
+    """
+    Возвращает thinking_config для API или None если выключено.
+    - Gemini 3+: {"thinking_level": "low/medium/high"}
+    - Остальные (Gemini 2.5 и др.): {"thinking_budget": N}
+    """
+    level = settings.get('thinking_budget', 'off')
+    if level == 'off':
+        return None
+
+    model = settings.get('model', '').lower()
+    is_gemini3 = 'gemini-3' in model or 'gemini3' in model
+
+    if is_gemini3:
+        # Gemini 3 использует строковый thinking_level
+        return {"thinking_level": level}  # level уже = "low"/"medium"/"high"
+    else:
+        # Gemini 2.5 и другие используют числовой thinking_budget
+        budget_map = {
+            'low': 1024,
+            'medium': 8192,
+            'high': 24576,
+        }
+        tokens = budget_map.get(level)
+        return {"thinking_budget": tokens} if tokens else None
+
+
 async def send_to_perplexity(settings: dict, message: str) -> str:
     url = "https://api.perplexity.ai/chat/completions"
     sys_prompt = f"{settings.get('model_prompt', '')}. Запрещается использовать markdown и прочую разметку, не добавляй эмодзи."
@@ -1267,6 +1319,9 @@ async def send_to_chatgpt(settings: dict, message: str) -> str:
         "max_tokens": settings.get('max_tokens', 2000),
         "temperature": 0.5 if format_type == 'short' else 0.7 # Понижаем температуру для коротких ответов (меньше креатива, больше четкости)
     }
+    thinking_cfg = get_thinking_config(settings)
+    if thinking_cfg:
+        data["thinking_config"] = thinking_cfg
     
     headers = {
         "Content-Type": "application/json", 
@@ -1332,6 +1387,9 @@ async def send_image_to_api(settings: dict, image_base64: str, prompt: str) -> s
         "max_tokens": settings.get('max_tokens', 2000),
         "temperature": 0.5 if format_type == 'short' else 0.7
     }
+    thinking_cfg = get_thinking_config(settings)
+    if thinking_cfg:
+        data["thinking_config"] = thinking_cfg
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {settings['apikey']}"}
     
     async with aiohttp.ClientSession() as session:
@@ -1395,6 +1453,9 @@ async def send_video_to_api(settings: dict, video_base64: str, prompt: str, mime
         "max_tokens": settings.get('max_tokens', 2000),
         "temperature": 0.5 if format_type == 'short' else 0.7
     }
+    thinking_cfg = get_thinking_config(settings)
+    if thinking_cfg:
+        data["thinking_config"] = thinking_cfg
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {settings['apikey']}"}
 
     async with aiohttp.ClientSession() as session:
