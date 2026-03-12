@@ -11,7 +11,9 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from typing import Dict, Any, List
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # Импортируем pypdf для работы с PDF
 try:
@@ -24,8 +26,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Токены API
-API_TOKEN = "sss"
-OCR_API_TOKEN = "ss"
+API_TOKEN = os.getenv("API_TOKEN")
+OCR_API_TOKEN = os.getenv("OCR_API_TOKEN")
+
+if not API_TOKEN:
+    raise RuntimeError("API_TOKEN не найден в .env файле")
 
 # Инициализация
 bot = Bot(token=API_TOKEN)
