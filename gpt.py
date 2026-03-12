@@ -807,10 +807,12 @@ async def finish_setting_update(message: types.Message):
 @router.callback_query(F.data.startswith("split_"))
 @router.callback_query(F.data.startswith("photo_"))
 @router.callback_query(F.data.startswith("ask_photo_"))
+@router.callback_query(F.data.startswith("thinking_"))
 @router.callback_query(F.data == "show_ask_photo")
 @router.callback_query(F.data == "show_formats")
 @router.callback_query(F.data == "show_split")
 @router.callback_query(F.data == "show_photo_processing")
+@router.callback_query(F.data == "show_thinking")
 async def handle_toggles(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     data = callback.data
@@ -829,12 +831,14 @@ async def handle_toggles(callback: types.CallbackQuery):
         level = data.replace("thinking_", "")  # off / low / medium / high
         user_storage.set_profile_setting(user_id, 'thinking_budget', level)
 
-    # Определяем, куда возвращаться - в главное меню или в параметры запроса
-    # Проверяем текущее сообщение - если там клавиатура параметров, возвращаемся туда
     settings = user_storage.get_active_profile_settings(user_id)
-    
-    # По умолчанию возвращаемся в главное меню настроек
-    keyboard = get_profile_keyboard(settings)
+
+    # Кнопки из "Параметров запроса" — возвращаемся туда же
+    request_param_prefixes = ("photo_", "ask_photo_", "thinking_", "show_photo_processing", "show_ask_photo", "show_thinking")
+    if any(data.startswith(p) if p.endswith("_") else data == p for p in request_param_prefixes):
+        keyboard = get_request_params_keyboard(settings)
+    else:
+        keyboard = get_profile_keyboard(settings)
 
     try:
         await callback.message.edit_text(
